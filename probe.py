@@ -552,7 +552,7 @@ if __name__ == "__main__":
         "valid_size": 256,
         "max_prompt_length": 256,
         "max_response_length": 150,
-        "save_path": "probe_checkpoints/v3",
+        "save_path": "probe_checkpoints/probe_from_mlp",
         "n_layers": 36,
         "d_model": 2048,
         "patience": 10,
@@ -565,5 +565,6 @@ if __name__ == "__main__":
         "eval_interval": 50,
     }
     n_layers = config["n_layers"]
-    config["record_module_names"] = [f"model.layers.{idx}" for idx in range(n_layers)]
+    #config["record_module_names"] = [f"model.layers.{idx}" for idx in range(n_layers)]
+    config["record_module_names"] = [f"model.layers.{idx}.mlp" for idx in range(n_layers)]
     main(config)
