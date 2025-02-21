@@ -243,6 +243,7 @@ token_this = tokenizer.encode("this")[0]  # 574
 
 not_acts = []
 this_acts = []
+mean_acts = []
 for batch_idx, batch in enumerate(valid_dataloader):
 
     input_ids = batch["input_ids"].cuda()
@@ -278,7 +279,7 @@ for batch_idx, batch in enumerate(valid_dataloader):
     activations = torch.stack(
         [acts[:, -max_new_tokens:] for acts in recording.values()], dim=1
     )
-    print(resid_stream.shape)
+    mean_acts.append(activations.mean(dim=2).mean(dim=0).cpu())
 
     mask_not = (response[:, :-1] == token_open) & (response[:, 1:] == token_not)
     mask_this = (response[:, :-1] == token_open) & (response[:, 1:] == token_this)
@@ -324,8 +325,11 @@ for batch_idx, batch in enumerate(valid_dataloader):
             ].cpu()
         )
 
+# %%
+
 not_acts = torch.cat(not_acts, dim=1)
 this_acts = torch.cat(this_acts, dim=1)
+mean_acts = torch.stack(mean_acts, dim=0).mean(dim=0).cuda()
 
 # %%
 
@@ -336,6 +340,16 @@ _this_acts = this_acts.clone()
 _not_acts = _not_acts.mean(dim=1).cuda()
 _this_acts = _this_acts.mean(dim=1).cuda()
 
+# %%
+
+diffs = _this_acts - mean_acts
+
+# %%
+
+diffs.shape
+
+# %%
+
 _value_vecs = value_vecs[mlp_layers]
 
 print(_not_acts.shape)
@@ -344,11 +358,12 @@ print(_value_vecs.shape)
 # [layers, d_model, d_mlp]
 neg_scaled_value_vecs = _not_acts.unsqueeze(1) * _value_vecs
 pos_scaled_value_vecs = _this_acts.unsqueeze(1) * _value_vecs
+diff_scaled_value_vecs = diffs.unsqueeze(1) * _value_vecs
 
 # [layers, d_mlp]
 dot_prods = einsum(
     "layers d_model d_mlp, layers d_model -> layers d_mlp",
-    pos_scaled_value_vecs,
+    diff_scaled_value_vecs,
     probe_model[mlp_layers, :, 1],
 )
 

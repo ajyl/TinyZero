@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import random
 import numpy as np
@@ -148,13 +149,10 @@ def cache_valid_data(model, tokenizer, data_loader, config):
     record_module_names = config["record_module_names"]
     log_interval = config["log_interval"]
     eval_interval = config["eval_interval"]
-    probe_timestep_offset = config["probe_timestep_offset"]
     n_layers = config["n_layers"]
     d_model = config["d_model"]
-
-    token_open = tokenizer.encode(" (")[0]  # 320
-    token_not = tokenizer.encode("not")[0]  # 1921
-    token_this = tokenizer.encode("this")[0]  # 574
+    probe_timestep = config["probe_timestep"]
+    assert probe_timestep in ["last_int", "("]
 
     all_resid_streams = []
     all_labels = []
@@ -188,44 +186,94 @@ def cache_valid_data(model, tokenizer, data_loader, config):
         # [batch, prompt_length + max_new_tokens, d_model]
         seq = output.sequences
         response = seq[:, -max_new_tokens:]
-        response_text = tokenizer.batch_decode(seq, skip_special_tokens=True)
+        response_text = tokenizer.batch_decode(response, skip_special_tokens=True)
 
         # [batch, n_layers, response_length, d_model]
         resid_stream = torch.stack(
             [acts[:, -max_new_tokens:] for acts in recording.values()], dim=1
         )
 
-        mask_not = (response[:, :-1] == token_open) & (response[:, 1:] == token_not)
-        mask_this = (response[:, :-1] == token_open) & (response[:, 1:] == token_this)
-        batch_idx_not, timesteps_not = torch.where(mask_not)
-        batch_idx_this, timesteps_this = torch.where(mask_this)
+        if probe_timestep == "(":
+            token_open = tokenizer.encode(" (")[0]  # 320
+            token_not = tokenizer.encode("not")[0]  # 1921
+            token_this = tokenizer.encode("this")[0]  # 574
 
-        batch_idx_not = batch_idx_not
-        batch_idx_this = batch_idx_this
+            mask_not = (response[:, :-1] == token_open) & (response[:, 1:] == token_not)
+            mask_this = (response[:, :-1] == token_open) & (
+                response[:, 1:] == token_this
+            )
+            batch_idx_not, timesteps_not = torch.where(mask_not)
+            batch_idx_this, timesteps_this = torch.where(mask_this)
 
-        overlap_batches = torch.tensor(
-            sorted(
-                list(
-                    set(batch_idx_not.tolist()).intersection(
-                        set(batch_idx_this.tolist())
+            overlap_batches = torch.tensor(
+                sorted(
+                    list(
+                        set(batch_idx_not.tolist()).intersection(
+                            set(batch_idx_this.tolist())
+                        )
                     )
                 )
-            )
-        ).cuda()
-        batch_mask_not = torch.isin(batch_idx_not, overlap_batches)
-        batch_mask_this = torch.isin(batch_idx_this, overlap_batches)
+            ).cuda()
+            batch_mask_not = torch.isin(batch_idx_not, overlap_batches)
+            batch_mask_this = torch.isin(batch_idx_this, overlap_batches)
 
-        # TODO: probe_timestep_offset.
-        filtered_timesteps_not = {
-            b_idx: timesteps_not[(batch_idx_not == b_idx)]
-            for b_idx in overlap_batches.tolist()
-        }
-        filtered_timesteps_this = {
-            b_idx: timesteps_this[(batch_idx_this == b_idx)]
-            for b_idx in overlap_batches.tolist()
-        }
+            filtered_timesteps_not = {
+                b_idx: timesteps_not[(batch_idx_not == b_idx)]
+                for b_idx in overlap_batches.tolist()
+            }
+            filtered_timesteps_this = {
+                b_idx: timesteps_this[(batch_idx_this == b_idx)]
+                for b_idx in overlap_batches.tolist()
+            }
 
-        # resid_stream_sample: [n_layers, batch, d_model]
+        elif probe_timestep == "last_int":
+            filtered_timesteps_not = {}
+            filtered_timesteps_this = {}
+
+            for b_idx, text in enumerate(response_text):
+                tokens = tokenizer(text, return_offsets_mapping=True)
+                tokenized_text = tokenizer.convert_ids_to_tokens(tokens["input_ids"])
+                offsets = tokens["offset_mapping"]
+
+                matches = re.findall(r"=\s*(-?\d+)\s*\((not|this works)", text)
+
+                results = []
+                for match in matches:
+                    number, label = match  # Extract the number and label type
+
+                    # Find number position in text
+                    number_index = text.find(number)
+                    number_end = number_index + len(number)
+
+                    # Find corresponding token index
+                    token_indices = [
+                        i
+                        for i, (start, end) in enumerate(offsets)
+                        if start >= number_index and end <= number_end
+                    ]
+
+                    # Store results
+                    results.append(
+                        {
+                            "number": number,
+                            "tokens": [tokenized_text[i] for i in token_indices],
+                            "token_index": token_indices[-1],
+                            "all_token_indices": token_indices,
+                            "label": "not" if label == "not" else "this",
+                        }
+                    )
+                not_matches = [x for x in results if x["label"] == "not"]
+                this_matches = [x for x in results if x["label"] == "this"]
+
+                if len(not_matches) > 0 and len(this_matches) > 0:
+                    filtered_timesteps_not[b_idx] = torch.tensor(
+                        [r["token_index"] for r in not_matches]
+                    )
+                    filtered_timesteps_this[b_idx] = torch.tensor(
+                        [r["token_index"] for r in this_matches]
+                    )
+
+        # resid_stream: [batch, n_layers, response_length, d_model]
         resid_stream_sample, labels = _build_inner_batch(
             resid_stream, filtered_timesteps_not, filtered_timesteps_this
         )
@@ -386,9 +434,10 @@ def main(config):
     record_module_names = config["record_module_names"]
     log_interval = config["log_interval"]
     eval_interval = config["eval_interval"]
-    probe_timestep_offset = config["probe_timestep_offset"]
     n_layers = config["n_layers"]
     d_model = config["d_model"]
+    probe_timestep = config["probe_timestep"]
+    assert probe_timestep in ["last_int", "("]
     options = 2
 
     probe_model = torch.randn(
@@ -412,10 +461,6 @@ def main(config):
     lowest_val_loss = 1e10
     curr_patience = 0
     patience = config["patience"]
-
-    token_open = tokenizer.encode(" (")[0]  # 320
-    token_not = tokenizer.encode("not")[0]  # 1921
-    token_this = tokenizer.encode("this")[0]  # 574
 
     all_responses = []
     for batch_idx, batch in enumerate(train_dataloader):
@@ -447,42 +492,95 @@ def main(config):
         # [batch, prompt_length + max_new_tokens, d_model]
         seq = output.sequences
         response = seq[:, -max_new_tokens:]
-        response_text = tokenizer.batch_decode(seq, skip_special_tokens=True)
+        response_text = tokenizer.batch_decode(response, skip_special_tokens=True)
 
         # [batch, n_layers, response_length, d_model]
         resid_stream = torch.stack(
             [acts[:, -max_new_tokens:] for acts in recording.values()], dim=1
         )
 
-        mask_not = (response[:, :-1] == token_open) & (response[:, 1:] == token_not)
-        mask_this = (response[:, :-1] == token_open) & (response[:, 1:] == token_this)
-        batch_idx_not, timesteps_not = torch.where(mask_not)
-        batch_idx_this, timesteps_this = torch.where(mask_this)
+        if probe_timestep == "(":
+            token_open = tokenizer.encode(" (")[0]  # 320
+            token_not = tokenizer.encode("not")[0]  # 1921
+            token_this = tokenizer.encode("this")[0]  # 574
 
-        batch_idx_not = batch_idx_not
-        batch_idx_this = batch_idx_this
+            mask_not = (response[:, :-1] == token_open) & (response[:, 1:] == token_not)
+            mask_this = (response[:, :-1] == token_open) & (
+                response[:, 1:] == token_this
+            )
+            batch_idx_not, timesteps_not = torch.where(mask_not)
+            batch_idx_this, timesteps_this = torch.where(mask_this)
 
-        overlap_batches = torch.tensor(
-            sorted(
-                list(
-                    set(batch_idx_not.tolist()).intersection(
-                        set(batch_idx_this.tolist())
+            batch_idx_not = batch_idx_not
+            batch_idx_this = batch_idx_this
+
+            overlap_batches = torch.tensor(
+                sorted(
+                    list(
+                        set(batch_idx_not.tolist()).intersection(
+                            set(batch_idx_this.tolist())
+                        )
                     )
                 )
-            )
-        ).cuda()
-        batch_mask_not = torch.isin(batch_idx_not, overlap_batches)
-        batch_mask_this = torch.isin(batch_idx_this, overlap_batches)
+            ).cuda()
+            batch_mask_not = torch.isin(batch_idx_not, overlap_batches)
+            batch_mask_this = torch.isin(batch_idx_this, overlap_batches)
 
-        # TODO: probe_timestep_offset.
-        filtered_timesteps_not = {
-            b_idx: timesteps_not[(batch_idx_not == b_idx)]
-            for b_idx in overlap_batches.tolist()
-        }
-        filtered_timesteps_this = {
-            b_idx: timesteps_this[(batch_idx_this == b_idx)]
-            for b_idx in overlap_batches.tolist()
-        }
+            filtered_timesteps_not = {
+                b_idx: timesteps_not[(batch_idx_not == b_idx)]
+                for b_idx in overlap_batches.tolist()
+            }
+            filtered_timesteps_this = {
+                b_idx: timesteps_this[(batch_idx_this == b_idx)]
+                for b_idx in overlap_batches.tolist()
+            }
+
+        else:
+            filtered_timesteps_not = {}
+            filtered_timesteps_this = {}
+
+            for b_idx, text in enumerate(response_text):
+                tokens = tokenizer(text, return_offsets_mapping=True)
+                tokenized_text = tokenizer.convert_ids_to_tokens(tokens["input_ids"])
+                offsets = tokens["offset_mapping"]
+
+                matches = re.findall(r"=\s*(-?\d+)\s*\((not|this works)", text)
+
+                results = []
+                for match in matches:
+                    number, label = match  # Extract the number and label type
+
+                    # Find number position in text
+                    number_index = text.find(number)
+                    number_end = number_index + len(number)
+
+                    # Find corresponding token index
+                    token_indices = [
+                        i
+                        for i, (start, end) in enumerate(offsets)
+                        if start >= number_index and end <= number_end
+                    ]
+
+                    # Store results
+                    results.append(
+                        {
+                            "number": number,
+                            "tokens": [tokenized_text[i] for i in token_indices],
+                            "token_index": token_indices[-1],
+                            "all_token_indices": token_indices,
+                            "label": "not" if label == "not" else "this",
+                        }
+                    )
+                not_matches = [x for x in results if x["label"] == "not"]
+                this_matches = [x for x in results if x["label"] == "this"]
+
+                if len(not_matches) > 0 and len(this_matches) > 0:
+                    filtered_timesteps_not[b_idx] = torch.tensor(
+                        [r["token_index"] for r in not_matches]
+                    )
+                    filtered_timesteps_this[b_idx] = torch.tensor(
+                        [r["token_index"] for r in this_matches]
+                    )
 
         # resid_stream_sample: [n_layers, batch, d_model]
         resid_stream_sample, labels = _build_inner_batch(
@@ -551,20 +649,39 @@ if __name__ == "__main__":
         "batch_size": 128,
         "valid_size": 256,
         "max_prompt_length": 256,
-        "max_response_length": 150,
-        "save_path": "probe_checkpoints/probe_from_mlp",
+        "max_response_length": 200,
+        "save_path": "probe_checkpoints/probe_attn_out_last_int",
         "n_layers": 36,
         "d_model": 2048,
         "patience": 10,
-        # When offset == 0, train off of timestep
-        # that corresponds to "(".
-        # if offset == 1, train on timestep that
-        # correspond to "not" or "this".
-        "probe_timestep_offset": 0,
+        "probe_timestep": "last_int",
+        # "probe_timestep": "(",
         "log_interval": 5,
         "eval_interval": 50,
+        "probe_module": "attn",
     }
     n_layers = config["n_layers"]
-    #config["record_module_names"] = [f"model.layers.{idx}" for idx in range(n_layers)]
-    config["record_module_names"] = [f"model.layers.{idx}.mlp" for idx in range(n_layers)]
+    probe_module = config["probe_module"]
+
+    if probe_module == "resid_stream":
+        config["record_module_names"] = [f"model.layers.{idx}" for idx in range(n_layers)]
+    elif probe_module == "attn":
+        config["record_module_names"] = [
+            f"model.layers.{idx}.self_attn" for idx in range(n_layers)
+        ]
+    elif probe_module == "attn_o_proj":
+        print("Qwen attn output == attn_o_proj.")
+        breakpoint()
+        config["record_module_names"] = [
+            f"model.layers.{idx}.self_attn.o_proj" for idx in range(n_layers)
+        ]
+    elif probe_module == "mlp":
+        config["record_module_names"] = [
+            f"model.layers.{idx}.mlp" for idx in range(n_layers)
+        ]
+    else:
+        raise RuntimeError(f"Invalid probe module name: {probe_module}")
+    # config["record_module_names"] = [
+    #    f"model.layers.{idx}.mlp" for idx in range(n_layers)
+    # ]
     main(config)
