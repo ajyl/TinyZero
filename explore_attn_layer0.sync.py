@@ -357,8 +357,79 @@ def visualize_attention_patterns(attention_patterns):
 
 # %%
 
+
+def visualize_attention_patterns_at_timestep(attention_patterns):
+    """
+    Visualizes all attention patterns in a [num_heads, seq_len, seq_len] matrix.
+
+    Args:
+        attention_patterns (torch.Tensor): Tensor of shape [num_heads, seq_len, seq_len]
+    """
+    num_heads, seq_len, _ = attention_patterns.shape
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    attn_patterns = attention_patterns[:, -1, :].detach().cpu().numpy()
+    im = ax.imshow(attn_patterns, cmap="viridis", aspect="auto")
+
+    ax.set_xlabel("Key Positions")
+    ax.set_ylabel("Head Idx")
+
+    # Add color bar
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# %%
+
+
+def first_true_indices(tensor):
+    """
+    Finds the first occurrence of True in each row of a [batch, seq] boolean tensor.
+
+    Args:
+        tensor (torch.Tensor): A boolean tensor of shape [batch, seq].
+
+    Returns:
+        torch.Tensor: A tensor of shape [batch] containing the index of the first True in each row.
+                      If no True is found, returns -1 for that row.
+    """
+    batch_size, seq_len = tensor.shape
+
+    # Create an index tensor [0, 1, 2, ..., seq_len-1] and expand it across batch dimension
+    indices = torch.arange(seq_len, device=tensor.device).expand(batch_size, seq_len)
+
+    # Mask out positions where tensor is False (set to a large number so they are ignored in min())
+    masked_indices = torch.where(
+        tensor, indices, torch.tensor(seq_len, device=tensor.device)
+    )
+
+    # Find the minimum index where True occurs, or return -1 if no True is found
+    first_true = masked_indices.min(dim=1).values
+    first_true[first_true == seq_len] = (
+        -1
+    )  # Replace seq_len with -1 for rows where no True exists
+
+    return first_true
+
+
+# %%
+
+pad_offsets = first_true_indices(attention_mask.bool())
+
+# %%
+
 # Visualize the random attention patterns
 for idx, b_idx in enumerate(this_batch_idxs.tolist()):
     timesteps = this_timesteps[idx]
-    visualize_attention_patterns(attn_patterns[b_idx, :, :timesteps, :timesteps])
-
+    offset = offsets[b_idx]
+    visualize_attention_patterns(
+        attn_patterns[
+            b_idx, :, offset : offset + timesteps, offset : offset + timesteps
+        ]
+    )
+    print(timesteps)
+    visualize_attention_patterns_at_timestep(
+        attn_patterns[b_idx, :, offset : offset + timesteps, offset:offset+timesteps],
+    )
