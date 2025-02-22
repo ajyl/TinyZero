@@ -19,7 +19,10 @@ import json
 import random
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import plotly.express as px
+import pandas as pd
 import numpy as np
+from collections import Counter
 from transformers import (
     AutoTokenizer,
     AutoConfig,
@@ -35,6 +38,12 @@ from verl.utils.dataset.rl_dataset import RLHFDataset
 from record_utils import record_activations, get_module
 from parse_utils import get_target_indices
 from HookedQwen import convert_to_hooked_model
+
+# %%
+
+import plotly.io as pio
+
+pio.renderers.default = "notebook"
 
 # %%
 
@@ -205,6 +214,7 @@ record_module_names = [
     "model.layers.0.self_attn.o_proj",
     "model.layers.0.self_attn.hook_attn_pattern",
 ]
+
 
 for batch_idx, batch in enumerate(valid_dataloader):
 
@@ -420,16 +430,114 @@ pad_offsets = first_true_indices(attention_mask.bool())
 
 # %%
 
-# Visualize the random attention patterns
 for idx, b_idx in enumerate(this_batch_idxs.tolist()):
     timesteps = this_timesteps[idx]
-    offset = offsets[b_idx]
+    pad_offset = pad_offsets[b_idx]
+    prompt_offset = attn_patterns.shape[-1] - max_new_tokens
+    print(prompt_offset)
     visualize_attention_patterns(
         attn_patterns[
-            b_idx, :, offset : offset + timesteps, offset : offset + timesteps
+            b_idx,
+            :,
+            pad_offset : prompt_offset + timesteps,
+            pad_offset : prompt_offset + timesteps,
         ]
     )
     print(timesteps)
     visualize_attention_patterns_at_timestep(
-        attn_patterns[b_idx, :, offset : offset + timesteps, offset:offset+timesteps],
+        attn_patterns[
+            b_idx,
+            :,
+            pad_offset : prompt_offset + timesteps,
+            pad_offset : prompt_offset + timesteps,
+        ],
     )
+
+# %%
+
+
+def make_tokens_unique(tokens):
+    """
+    Ensures tokens are unique by appending an index to duplicates.
+
+    Args:
+        tokens (list of str): Original token list.
+
+    Returns:
+        list of str: Modified token list with unique names.
+    """
+    token_counts = Counter()
+    unique_tokens = []
+
+    for token in tokens:
+        token_counts[token] += 1
+        if token_counts[token] > 1:
+            unique_tokens.append(f"{token}(_{token_counts[token]})")
+        else:
+            unique_tokens.append(token)
+
+    return unique_tokens
+
+
+def plot_interactive_attention(attn_matrix, tokens, query_idx):
+    """
+    Creates an interactive heatmap for attention visualization.
+
+    Args:
+        attn_matrix (torch.Tensor): A tensor of shape [n_heads, seq_len] (single attention head).
+        tokens (list): List of tokens corresponding to sequence positions.
+    """
+    n_heads = attn_matrix.shape[0]
+    seq_len = attn_matrix.shape[1]
+    uniq_tokens = make_tokens_unique(tokens)
+
+    # Convert to a Pandas DataFrame for easy plotting
+    df = pd.DataFrame(
+        attn_matrix.cpu().numpy(),
+        index=[f"Head {i}" for i in range(n_heads)],
+        columns=uniq_tokens,
+    )
+
+    hover_text = [
+        [
+            f"Token: {df.columns[j]}<br>(Index: {j})<br>Score: {df.iloc[i, j]:.2f}"
+            for j in range(timesteps)
+        ]
+        for i in range(n_heads)
+    ]
+
+    # Create the heatmap
+    fig = px.imshow(
+        df,
+        x=uniq_tokens,
+        y=df.index,
+        labels=dict(x="Key Tokens", y="Attention Heads", color="Attention Score"),
+        color_continuous_scale="viridis",
+        text_auto=False,
+    )
+    fig.update_traces(hoverinfo="text", text=hover_text)
+
+    # Improve interactivity
+    fig.update_layout(
+        title="Interactive Attention Map",
+        xaxis_title="Key Positions (Tokens Being Attended To)",
+        yaxis_title="Attention Heads",
+        hovermode="closest",
+    )
+
+    fig.show()
+    fig.write_html("attention_map.html")
+
+
+# %%
+
+for idx, b_idx in enumerate(this_batch_idxs.tolist()):
+    timesteps = this_timesteps[idx].item()
+    offset = pad_offsets[b_idx]
+    prompt_offset = attn_patterns.shape[-1] - max_new_tokens
+    attn_at_timestep = attn_patterns[
+        b_idx, :, prompt_offset + timesteps + 1, offset : prompt_offset + timesteps + 1
+    ]
+    print(attn_at_timestep.shape)
+    tokens = tokenizer.batch_decode(seq[b_idx][offset : prompt_offset + timesteps + 1])
+    plot_interactive_attention(attn_at_timestep, tokens, prompt_offset + timesteps)
