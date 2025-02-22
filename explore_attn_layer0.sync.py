@@ -18,6 +18,7 @@ import os
 import json
 import random
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 import numpy as np
 from transformers import (
     AutoTokenizer,
@@ -32,7 +33,6 @@ import einops
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from record_utils import record_activations, get_module
-from hook_utils import HookWithCountThreshold
 from parse_utils import get_target_indices
 from HookedQwen import convert_to_hooked_model
 
@@ -156,6 +156,10 @@ config = {
 
 # %%
 
+seed_all(config["seed"])
+
+# %%
+
 
 model_path = config["model_path"]
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -190,11 +194,16 @@ hook_config = config["hook_config"]
 
 # %%
 
+actor_model
+
+# %%
+
 record_module_names = [
     "model.layers.0.self_attn.q_proj",
     "model.layers.0.self_attn.k_proj",
     "model.layers.0.self_attn.v_proj",
     "model.layers.0.self_attn.o_proj",
+    "model.layers.0.self_attn.hook_attn_pattern",
 ]
 
 for batch_idx, batch in enumerate(valid_dataloader):
@@ -218,9 +227,9 @@ for batch_idx, batch in enumerate(valid_dataloader):
     # len(recording["model.layers.0"]): max_response_length
     # recording["model.layers.0"][0].shape: [batch, prompt_length, d_model]
     # recording["model.layers.0"][1].shape: [batch, 1, d_model]
-    recording = {
-        layer_name: torch.cat(acts, dim=1) for layer_name, acts in recording.items()
-    }
+    # recording = {
+    #    layer_name: torch.cat(acts, dim=1) for layer_name, acts in recording.items()
+    # }
 
     # recording["model.layers.0"].shape:
     # [batch, prompt_length + max_new_tokens, d_model]
@@ -233,7 +242,8 @@ for batch_idx, batch in enumerate(valid_dataloader):
         response, " (", "this", tokenizer
     )
     print(response_text)
-    break
+    if this_batch_idxs.shape[0] > 0:
+        break
 
 
 # %%
@@ -241,16 +251,16 @@ for batch_idx, batch in enumerate(valid_dataloader):
 # TODO: WHy seq_len - 1?
 # [batch, seq_len - 1, d_model]
 # q_proj: nn.Linear(d_model, num_heads (16) * head_dim (128))
-q_proj = recording["model.layers.0.self_attn.q_proj"]
+q_proj = torch.cat(recording["model.layers.0.self_attn.q_proj"], dim=1)
 # [batch, seq_len - 1, d_head * num_kv_heads]
 # k_proj: nn.Linear(d_model, num_key_value_heads (2) * head_dim (128))
-k_proj = recording["model.layers.0.self_attn.k_proj"]
+k_proj = torch.cat(recording["model.layers.0.self_attn.k_proj"], dim=1)
 # [batch, seq_len - 1, d_head * num_kv_heads]
 # v_proj: nn.Linear(d_model, num_key_value_heads (2) * head_dim (128))
-v_proj = recording["model.layers.0.self_attn.v_proj"]
+v_proj = torch.cat(recording["model.layers.0.self_attn.v_proj"], dim=1)
 # [batch, seq_len - 1, d_model]
 # o_proj: nn.Linear(num_heads (16) * head_dim (128), d_model)
-o_proj = recording["model.layers.0.self_attn.o_proj"]
+o_proj = torch.cat(recording["model.layers.0.self_attn.o_proj"], dim=1)
 
 # %%
 
@@ -265,5 +275,90 @@ print("query_states.shape:", query_states.shape)
 print("key_states.shape:", key_states.shape)
 print("value_states.shape:", value_states.shape)
 
+# %%
+
+
+def pad_and_concatenate(tensor_list):
+    """
+    Pads and concatenates a list of tensors along the given dimension.
+
+    Args:
+        tensor_list (list of torch.Tensor): List of tensors to concatenate.
+
+    Returns:
+        torch.Tensor: Padded and concatenated tensor.
+    """
+    # Find the max size in the target dimension
+    max_size = tensor_list[-1].shape[-1]
+
+    # Pad each tensor to match max_size in the given dimension
+    padded_tensors = []
+    for tensor_idx, tensor in enumerate(tensor_list):
+        if tensor_idx == 0:
+            zeros = torch.zeros(
+                tensor.shape[0],
+                tensor.shape[1],
+                tensor.shape[2],
+                max_size,
+                device=tensor_list[-1].device,
+            )
+        else:
+            zeros = torch.zeros_like(tensor_list[-1])
+        zeros[:, :, :, : tensor.shape[-1]] = tensor
+        padded_tensors.append(zeros)
+
+    attn_pattern = torch.cat(padded_tensors, dim=2)
+    print(attn_pattern.shape)
+    assert attn_pattern.shape[2] == attn_pattern.shape[3]
+    return attn_pattern
+
 
 # %%
+
+attn_patterns = pad_and_concatenate(
+    recording["model.layers.0.self_attn.hook_attn_pattern"]
+)
+
+# %%
+
+
+def visualize_attention_patterns(attention_patterns):
+    """
+    Visualizes all attention patterns in a [num_heads, seq_len, seq_len] matrix.
+
+    Args:
+        attention_patterns (torch.Tensor): Tensor of shape [num_heads, seq_len, seq_len]
+    """
+    num_heads, seq_len, _ = attention_patterns.shape
+
+    grid_size = int(num_heads**0.5)
+    fig, axes = plt.subplots(
+        grid_size, grid_size, figsize=(grid_size * 4, grid_size * 4)
+    )
+
+    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)  # Upper triangular mask
+
+    for i, ax in enumerate(axes.flat):
+        attn_map = attention_patterns[i].detach().cpu().numpy()
+        attn_map[mask.bool().numpy()] = float("nan")
+
+        im = ax.imshow(attn_map, cmap="viridis", aspect="auto")
+
+        ax.set_title(f"Head {i+1}")
+        ax.set_xlabel("Key Positions")
+        ax.set_ylabel("Query Positions")
+
+        # Add color bar
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# %%
+
+# Visualize the random attention patterns
+for idx, b_idx in enumerate(this_batch_idxs.tolist()):
+    timesteps = this_timesteps[idx]
+    visualize_attention_patterns(attn_patterns[b_idx, :, :timesteps, :timesteps])
+
