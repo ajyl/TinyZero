@@ -20,6 +20,8 @@ import random
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import plotly.express as px
+import plotly.subplots as sp
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 from collections import Counter
@@ -212,7 +214,9 @@ record_module_names = [
     "model.layers.0.self_attn.k_proj",
     "model.layers.0.self_attn.v_proj",
     "model.layers.0.self_attn.o_proj",
-    "model.layers.0.self_attn.hook_attn_pattern",
+] + [
+    f"model.layers.{layer_idx}.self_attn.hook_attn_pattern"
+    for layer_idx in range(n_layers)
 ]
 
 
@@ -325,8 +329,14 @@ def pad_and_concatenate(tensor_list):
 
 # %%
 
-attn_patterns = pad_and_concatenate(
-    recording["model.layers.0.self_attn.hook_attn_pattern"]
+attn_patterns = torch.stack(
+    [
+        pad_and_concatenate(
+            recording[f"model.layers.{layer_idx}.self_attn.hook_attn_pattern"]
+        )
+        for layer_idx in range(n_layers)
+    ],
+    dim=1,
 )
 
 # %%
@@ -368,17 +378,17 @@ def visualize_attention_patterns(attention_patterns):
 # %%
 
 
-def visualize_attention_patterns_at_timestep(attention_patterns):
+def visualize_attention_patterns_at_timestep(attention_patterns, layer_idx):
     """
     Visualizes all attention patterns in a [num_heads, seq_len, seq_len] matrix.
 
     Args:
         attention_patterns (torch.Tensor): Tensor of shape [num_heads, seq_len, seq_len]
     """
-    num_heads, seq_len, _ = attention_patterns.shape
+    num_layers, num_heads, seq_len, _ = attention_patterns.shape
     fig, ax = plt.subplots(figsize=(14, 8))
 
-    attn_patterns = attention_patterns[:, -1, :].detach().cpu().numpy()
+    attn_patterns = attention_patterns[:, layer_idx, -1, :].detach().cpu().numpy()
     im = ax.imshow(attn_patterns, cmap="viridis", aspect="auto")
 
     ax.set_xlabel("Key Positions")
@@ -430,6 +440,7 @@ pad_offsets = first_true_indices(attention_mask.bool())
 
 # %%
 
+layer_idx = 0
 for idx, b_idx in enumerate(this_batch_idxs.tolist()):
     timesteps = this_timesteps[idx]
     pad_offset = pad_offsets[b_idx]
@@ -438,6 +449,7 @@ for idx, b_idx in enumerate(this_batch_idxs.tolist()):
     visualize_attention_patterns(
         attn_patterns[
             b_idx,
+            layer_idx,
             :,
             pad_offset : prompt_offset + timesteps,
             pad_offset : prompt_offset + timesteps,
@@ -448,9 +460,11 @@ for idx, b_idx in enumerate(this_batch_idxs.tolist()):
         attn_patterns[
             b_idx,
             :,
+            :,
             pad_offset : prompt_offset + timesteps,
             pad_offset : prompt_offset + timesteps,
         ],
+        layer_idx
     )
 
 # %%
@@ -468,15 +482,15 @@ def make_tokens_unique(tokens):
     """
     token_counts = Counter()
     unique_tokens = []
+    token_display_map = {}
 
     for token in tokens:
         token_counts[token] += 1
-        if token_counts[token] > 1:
-            unique_tokens.append(f"{token}(_{token_counts[token]})")
-        else:
-            unique_tokens.append(token)
+        unique_token = f"{token}__{token_counts[token]}"
+        unique_tokens.append(unique_token)
+        token_display_map[unique_token] = token
 
-    return unique_tokens
+    return unique_tokens, token_display_map
 
 
 def plot_interactive_attention(attn_matrix, tokens, query_idx):
@@ -489,7 +503,7 @@ def plot_interactive_attention(attn_matrix, tokens, query_idx):
     """
     n_heads = attn_matrix.shape[0]
     seq_len = attn_matrix.shape[1]
-    uniq_tokens = make_tokens_unique(tokens)
+    uniq_tokens, display_tokens = make_tokens_unique(tokens)
 
     # Convert to a Pandas DataFrame for easy plotting
     df = pd.DataFrame(
@@ -500,8 +514,8 @@ def plot_interactive_attention(attn_matrix, tokens, query_idx):
 
     hover_text = [
         [
-            f"Token: {df.columns[j]}<br>(Index: {j})<br>Score: {df.iloc[i, j]:.2f}"
-            for j in range(timesteps)
+            f"Token: {display_tokens[df.columns[j]]}<br>(Index: {j})<br>Score: {df.iloc[i, j]:.2f}"
+            for j in range(seq_len)
         ]
         for i in range(n_heads)
     ]
@@ -531,13 +545,151 @@ def plot_interactive_attention(attn_matrix, tokens, query_idx):
 
 # %%
 
+
+def plot_interactive_attention_all_layers(attn_matrix, tokens):
+    """
+    Creates an interactive heatmap for attention visualization.
+
+    Args:
+        attn_matrix (torch.Tensor): A tensor of shape [n_heads, seq_len] (single attention head).
+        tokens (list): List of tokens corresponding to sequence positions.
+    """
+    n_layers = attn_matrix.shape[0]
+    n_heads = attn_matrix.shape[1]
+    seq_len = attn_matrix.shape[2]
+    uniq_tokens, display_tokens = make_tokens_unique(tokens)
+
+    fig = sp.make_subplots(
+        rows=n_layers,
+        cols=1,
+        subplot_titles=[f"Layer {i}" for i in range(n_layers)],
+    )
+
+    for layer in range(n_layers):
+        attn = attn_matrix[layer]
+        # Convert to a Pandas DataFrame for easy plotting
+        df = pd.DataFrame(
+            attn.cpu().numpy(),
+            index=[f"Head {i}" for i in range(n_heads)],
+            columns=uniq_tokens,
+        )
+
+        hover_text = [
+            [
+                f"Token: {display_tokens[df.columns[j]]}<br>Head: {i}<br>Index: {j}<br>Score: {df.iloc[i, j]:.2f}"
+                for j in range(seq_len)
+            ]
+            for i in range(n_heads)
+        ]
+
+        # Create the heatmap
+        heatmap = go.Heatmap(
+            z=df.values,
+            x=uniq_tokens,
+            y=df.index,
+            colorscale="viridis",
+            text=hover_text,
+            hoverinfo="text",
+            zmin=0,
+            zmax=1,
+        )
+        fig.add_trace(heatmap, row=layer+1, col=1)
+
+    height = n_layers * 350
+    # Improve interactivity
+    fig.update_layout(
+        title="Interactive Attention Map",
+        xaxis_title="Key Positions (Tokens Being Attended To)",
+        yaxis_title="Attention Heads",
+        hovermode="closest",
+        height=height,
+    )
+
+    fig.write_html("attention_map_all_layers.html")
+
+
+# %%
+
 for idx, b_idx in enumerate(this_batch_idxs.tolist()):
     timesteps = this_timesteps[idx].item()
     offset = pad_offsets[b_idx]
     prompt_offset = attn_patterns.shape[-1] - max_new_tokens
     attn_at_timestep = attn_patterns[
-        b_idx, :, prompt_offset + timesteps + 1, offset : prompt_offset + timesteps + 1
+        b_idx,
+        0,
+        :,
+        prompt_offset + timesteps,
+        offset : prompt_offset + timesteps + 1,
     ]
     print(attn_at_timestep.shape)
     tokens = tokenizer.batch_decode(seq[b_idx][offset : prompt_offset + timesteps + 1])
     plot_interactive_attention(attn_at_timestep, tokens, prompt_offset + timesteps)
+    break
+
+
+# %%
+
+
+for idx, b_idx in enumerate(this_batch_idxs.tolist()):
+    timesteps = this_timesteps[idx].item()
+    pad_offset = pad_offsets[b_idx]
+    prompt_offset = attn_patterns.shape[-1] - max_new_tokens
+    attn_at_timestep = attn_patterns[
+        b_idx,
+        :,
+        :,
+        prompt_offset + timesteps,
+        pad_offset : prompt_offset + timesteps + 1,
+    ]
+    print(attn_at_timestep.shape)
+    tokens = tokenizer.batch_decode(seq[b_idx][pad_offset : prompt_offset + timesteps + 1])
+    plot_interactive_attention_all_layers(
+        attn_at_timestep, tokens
+    )
+    breakpoint()
+    break
+
+
+# %%
+
+# Layer 3, Head 13
+# Layer 4, Head 5
+# Layer 4, Head 0
+# Layer 5, Head 9
+# Layer 5, Head 14
+# Layer 6, Head 6 (maybe)
+# Layer 10, Head 0
+# Layer 10, Head 5
+# Layer 11, Head 8
+# Layer 12, Head 3
+# Layer 13, Head 6
+# Layer 13, Head 3
+# Layer 15, Head 8
+# Layer 15, Head 4
+# Layer 17, Head 14
+# Layer 17, Head 13
+# Layer 17, Head 11
+# Layer 17, Head 10
+# Layer 17, Head 19
+# Layer 17, Head 3
+# Layer 17, Head 1
+# Layer 18, Head 7 (maybe)
+# Layer 18, Head 3 (maybe)
+# Layer 19, Head 13
+# Layer 19, Head 8
+# Layer 19, Head 14 (maybe)
+# Layer 19, Head 12 (maybe)
+# Layer 19, Head 6 (maybe)
+# Layer 19, Head 0 (maybe)
+# Layer 20, Head 1 (attends to next token after "62")
+# Layer 20, Head 3 (attends to next token after "62")
+# Layer 20, Head 4 (attends to next token after "62")
+# Layer 20, Head 5 (attends to next token after "62")
+# Layer 20, Head 6 (attends to next token after "62")
+# Layer 21, Head 7
+# Layer 21, Head 14
+# Layer 21, Head 2
+# Layer 22, Head 14
+# Layer 22, Head 12
+# Layer 25, Head 14
+# Layer 25, Head 11
